@@ -1,15 +1,14 @@
+import sys
+sys.stdout.reconfigure(encoding='utf-8')
 import gradio as gr
-from httpx import AsyncClient
 from docx import Document
 import numpy as np
-# 在WebUI类初始化前配置HTTP客户端
-gr.routes.client = AsyncClient(verify=False)
 import time
 from pdf_processor import PDFProcessor
 from vector_db import VectorDB
 from llm_integration import PatentGenerator
 import os
-os.environ["SSL_CERT_FILE"] = r"H:\anadonda\envs\OpenPatent\Library\ssl\cacert.pem"
+# os.environ["SSL_CERT_FILE"] = r"H:\anadonda\envs\OpenPatent\Library\ssl\cacert.pem"
 from docx.oxml.ns import qn
 
 class WebUI:
@@ -50,6 +49,17 @@ class WebUI:
                 tech_doc = gr.File(label="技术文档(.docx)")
                 
             with gr.Tab("3. 生成专利文档"):
+                stage_selector = gr.Dropdown(
+                    choices=[
+                        ("阶段0 基线（无术语表, 高温, 独立生成）", 0),
+                        ("阶段1 术语约束（术语表 + 低温）", 1),
+                        ("阶段2 分层串联（+ 权利要求/摘要依赖说明书）", 2),
+                    ],
+                    value=2,
+                    label="消融实验阶段（切换后点一键分层生成即按该阶段运行）",
+                )
+                with gr.Row():
+                    gen_all_btn = gr.Button("一键分层生成（说明书→权利要求→摘要）", variant="primary")
                 with gr.Row():
                     gen_spec_btn = gr.Button("生成说明书")
                     gen_abstract_btn = gr.Button("生成摘要")
@@ -65,6 +75,7 @@ class WebUI:
             # 绑定事件
             process_btn.click(self.process_patents, inputs=ref_patents, outputs=process_output)
             process_btn2.click(self.load_existing_db, outputs=process_output)
+            gen_all_btn.click(self.generate_all_layered, inputs=[tech_doc, stage_selector], outputs=output_preview)
             gen_spec_btn.click(self.generate_specification, inputs=tech_doc, outputs=output_preview)
             gen_abstract_btn.click(self.generate_abstract, inputs=tech_doc, outputs=output_preview)
             gen_claims_btn.click(self.generate_claims, inputs=tech_doc, outputs=output_preview)
@@ -87,8 +98,13 @@ class WebUI:
         processor = PDFProcessor()
         
         section_array = []
+        skipped = []
         for file in files:
-            sections = processor.split_pdf(file.name)
+            try:
+                sections = processor.split_pdf(file.name)
+            except Exception as e:
+                skipped.append(f"{os.path.basename(file.name)}（{type(e).__name__}）")
+                continue
             for db_type in self.db_paths:
                 section_content = sections.get(db_type)
                 section_array.append(section_content)
@@ -108,7 +124,10 @@ class WebUI:
             self.db_list[i].create_index(section_array[i])
             self.db_list[i].save_index(self.db_paths[db_type])
         self.use_existing_db = True
-        return "参考专利处理完成，已建立三个知识库！"
+        msg = "参考专利处理完成，已建立三个知识库！"
+        if skipped:
+            msg += "\n\n⚠️ 以下文件损坏或无法解析，已跳过：\n" + "\n".join(skipped)
+        return msg
 
     def load_existing_db(self):
         """
@@ -161,6 +180,58 @@ class WebUI:
         """
         return self._generate_draft(tech_doc, "权 利 要 求 书", "权利要求书")
 
+    def generate_all_layered(self, tech_doc, stage=2):
+        """
+        【消融实验】一键分层生成：按 说明书 → 权利要求 → 摘要 的顺序串联生成。
+        stage 控制启用哪些改进（0基线 / 1术语约束 / 2分层串联），供消融对比。
+        阶段>=2 时，后层以已生成的说明书为事实依据，保证特征支撑与跨部分一致。
+        """
+        if not self.use_existing_db:
+            return [("系统", "请先处理参考专利或选择已有知识库")]
+        if tech_doc is None:
+            return [("系统", "请先上传技术文档")]
+
+        stage = int(stage)
+        # 把档位下发给生成器，generate_draft 会据此决定温度/术语表/串联依赖
+        self.patent_generator.stage = stage
+
+        # 读取技术文档
+        doc = Document(tech_doc.name)
+        query = "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
+
+        # 每次一键生成前重置状态，避免上一份文档的草稿/术语表污染（多文档实验必需）
+        self.patent_generator.current_draft = {}
+        self.patent_generator.glossary = ""
+
+        # 术语表仅在 stage>=1 构建（stage0 基线不用术语表）
+        if stage >= 1:
+            glossary = self.patent_generator.build_glossary(query)
+            print(f"【术语表】\n{glossary}")
+            try:
+                with open("glossary_latest.txt", "w", encoding="utf-8") as gf:
+                    gf.write(glossary)
+            except Exception as e:
+                print(f"术语表存档失败: {e}")
+
+        db_map = {"摘要": 0, "说 明 书": 1, "权 利 要 求 书": 2}
+        messages = [("系统", f"【阶段{stage}】开始生成：说明书 → 权利要求 → 摘要 ...")]
+
+        # 顺序固定：说明书先生成，stage>=2 时权利要求和摘要会依赖它
+        plan = [
+            ("说 明 书", "说明书"),
+            ("权 利 要 求 书", "权利要求书"),
+            ("摘要", "摘要"),
+        ]
+        for db_type, doc_type in plan:
+            vector_db = self.db_list[db_map[db_type]]
+            related = vector_db.query(query, top_k=2)
+            context = "\n".join(related) if related else "无相关专利内容"
+            content = self.patent_generator.generate_draft(query, context, doc_type)
+            self.current_doc_type = doc_type
+            messages.append(("助手", f"【{doc_type}】\n{content}"))
+
+        return messages
+
     def _generate_draft(self, tech_doc, db_type: str, doc_type: str):
         """
         生成专利文档初稿。
@@ -181,6 +252,19 @@ class WebUI:
         # 读取技术文档内容
         doc = Document(tech_doc.name)
         query = "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
+
+        # 【阶段1】首次生成时，用技术文档构建术语表，供后续各部分共享，保证术语一致
+        # （stage0 基线不用术语表；单独按钮沿用 generator 当前 stage 档位）
+        if self.patent_generator.stage >= 1 and not self.patent_generator.glossary:
+            glossary = self.patent_generator.build_glossary(query)
+            print(f"【术语表】\n{glossary}")
+            # 自动存档术语表，供后续指标计算使用（不依赖翻终端）
+            try:
+                with open("glossary_latest.txt", "w", encoding="utf-8") as gf:
+                    gf.write(glossary)
+                print("【术语表已存到 glossary_latest.txt】")
+            except Exception as e:
+                print(f"术语表存档失败: {e}")
 
         # 加载向量数据库
         db_map = {"摘要":0,"说 明 书":1,"权 利 要 求 书":2}
@@ -285,4 +369,4 @@ class WebUI:
             ]
 
 if __name__ == "__main__":
-    WebUI().init_interface().launch()
+    WebUI().init_interface().launch(show_api=False)

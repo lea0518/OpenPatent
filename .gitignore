@@ -1,0 +1,9 @@
+# 环境变量 / 密钥，绝不提交
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# 生成的专利文档
+*.gradio_*.docx

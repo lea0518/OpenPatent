@@ -147,6 +147,7 @@ class PatentGenerator:
                     {"role": "user", "content": prompt}
                 ],
                 temperature=gen_temp,  # 【消融】stage0=0.5 / stage>=1=0.2
+                max_tokens=8000,       # 避免长说明书被默认上限截断
                 stream=False,
             )
             
@@ -218,6 +219,7 @@ class PatentGenerator:
                     {"role": "user", "content": prompt}
                 ],
                 temperature=rev_temp,  # 【消融】stage0=0.6 / stage>=1=0.2
+                max_tokens=8000,       # 避免长说明书被默认上限截断
                 stream=False,
             )
             

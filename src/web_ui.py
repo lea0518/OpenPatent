@@ -22,6 +22,7 @@ class WebUI:
         self.patent_generator = PatentGenerator()
         self.current_stage = None
         self.current_doc_type = None
+        self.tech_doc_name = None          # 记住上传的技术文档名（不含扩展名），用于命名输出
         self.db_paths = {
             '摘要': r'dbs\abstract',
             '说 明 书': r'dbs\specification',
@@ -197,6 +198,8 @@ class WebUI:
 
         # 读取技术文档
         doc = Document(tech_doc.name)
+        # 记住上传文档名（去掉路径和扩展名），供保存时命名用
+        self.tech_doc_name = os.path.splitext(os.path.basename(tech_doc.name))[0]
         query = "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
 
         # 每次一键生成前重置状态，避免上一份文档的草稿/术语表污染（多文档实验必需）
@@ -251,6 +254,8 @@ class WebUI:
 
         # 读取技术文档内容
         doc = Document(tech_doc.name)
+        # 记住上传文档名（去掉路径和扩展名），供保存时命名用
+        self.tech_doc_name = os.path.splitext(os.path.basename(tech_doc.name))[0]
         query = "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
 
         # 【阶段1】首次生成时，用技术文档构建术语表，供后续各部分共享，保证术语一致
@@ -288,6 +293,49 @@ class WebUI:
                 ("助手", f"生成失败: {str(e)}")
             ]
 
+    def _save_content_to_docx(self, content, doc_type, out_dir="."):
+        """把一份草稿内容按专利格式存成 docx，存到 out_dir，返回文件路径。"""
+        from docx import Document
+        from docx.shared import Pt
+        from docx.enum.text import WD_LINE_SPACING
+
+        doc = Document()
+        doc.styles['Normal'].font.name = '宋体'
+        doc.styles['Normal']._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
+        heading_style = doc.styles['Heading 1']
+        heading_style.font.name = '宋体'
+        heading_style._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
+        heading_style.font.size = Pt(10.5)
+        heading_style.font.bold = True
+        heading_style.paragraph_format.space_before = Pt(6)
+        heading_style.paragraph_format.space_after = Pt(6)
+        heading_style.paragraph_format.line_spacing_rule = WD_LINE_SPACING.SINGLE
+
+        body_style = doc.styles['Normal']
+        body_style.font.name = '宋体'
+        body_style._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
+        body_style.font.size = Pt(10.5)
+        body_style.paragraph_format.space_before = Pt(0)
+        body_style.paragraph_format.space_after = Pt(0)
+        body_style.paragraph_format.line_spacing_rule = WD_LINE_SPACING.SINGLE
+        body_style.paragraph_format.first_line_indent = Pt(0)
+
+        import re
+        # 只提取成对完整的标签，忽略截断残片（如 "...</parag"）
+        for tag, text in re.findall(r'<(标题|段落)>(.*?)</\1>', content, flags=re.S):
+            text = text.strip()
+            if not text:
+                continue
+            if tag == '标题':
+                doc.add_paragraph(text, style='Heading 1')
+            else:
+                doc.add_paragraph(text)
+
+        base = self.tech_doc_name or "patent"
+        filename = os.path.join(out_dir, f"{base}_{doc_type}.docx")
+        doc.save(filename)
+        return filename
+
     def submit_feedback(self, feedback):
         """
         提交用户反馈，根据反馈内容进行文档保存或修订。
@@ -305,55 +353,19 @@ class WebUI:
 
         try:
             if '满意' in feedback:
-                current_content = self.patent_generator.current_draft.get(self.current_doc_type, "No draft available")
-                messages = [
-                    ("系统", "文档已确认满意，开始保存..."),
-                    ("助手", current_content)
-                ]
-                from docx import Document
-                from docx.shared import Pt
-                from docx.enum.text import WD_LINE_SPACING
-
-                # 创建新文档并设置全局样式
-                doc = Document()
-                doc.styles['Normal'].font.name = '宋体'
-                doc.styles['Normal']._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
-                # 确保 Heading 1 样式的字体为宋体
-                heading_style = doc.styles['Heading 1']
-                heading_style.font.name = '宋体'
-                heading_style._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
-                heading_style.font.size = Pt(10.5)  # 宋体五号
-                heading_style.font.bold = True
-                heading_style.paragraph_format.space_before = Pt(6)
-                heading_style.paragraph_format.space_after = Pt(6)
-                heading_style.paragraph_format.line_spacing_rule = WD_LINE_SPACING.SINGLE
-
-                # 创建一个新的段落样式用于正文
-                body_style = doc.styles['Normal']
-                body_style.font.name = '宋体'
-                body_style._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
-                body_style.font.size = Pt(10.5)  # 宋体五号
-                body_style.paragraph_format.space_before = Pt(0)  # 正文段落前无缩进
-                body_style.paragraph_format.space_after = Pt(0)   # 正文段落后无缩进
-                body_style.paragraph_format.line_spacing_rule = WD_LINE_SPACING.SINGLE
-                body_style.paragraph_format.first_line_indent = Pt(0)  # 无缩进
-                # 解析XML标签并应用格式
-                paragraphs = current_content.split('\n')
-                for para in paragraphs:
-                    if para.startswith('<标题>'):
-                        title = para[4:-5].strip()  # 提取<标题>内容</标题>
-                        title_para = doc.add_paragraph(title, style='Heading 1')
-                    elif para.startswith('<段落>'):
-                        content = para[4:-5].strip()  # 提取<段落>内容</段落>
-                        p = doc.add_paragraph(content)
-                        # p.paragraph_format.space_before = Pt(3)
-                        # p.paragraph_format.line_spacing_rule = WD_LINE_SPACING.SINGLE
-                        # p.paragraph_format.first_line_indent = Pt(0)  # 无缩进
-
-                # 保存文档
-                filename = f"{self.current_doc_type}.gradio_{int(time.time())}.docx"
-                doc.save(filename)
-                messages.append( ("系统", f"文件已保存为：{filename}") )
+                messages = [("系统", "文档已确认满意，开始保存...")]
+                drafts = self.patent_generator.current_draft
+                if not drafts:
+                    return [("系统", "没有可保存的草稿")]
+                # 本批三份文件统一放进一个子文件夹：outputs/文档名_时间戳/
+                base = self.tech_doc_name or "patent"
+                out_dir = os.path.join("outputs", f"{base}_{int(time.time())}")
+                os.makedirs(out_dir, exist_ok=True)
+                # 遍历所有已生成的部分（说明书/权利要求书/摘要），逐个保存
+                for doc_type, content in drafts.items():
+                    filename = self._save_content_to_docx(content, doc_type, out_dir)
+                    messages.append(("助手", f"【{doc_type}】已保存为：{filename}"))
+                messages.append(("系统", f"全部保存在文件夹：{out_dir}"))
                 return messages
             else:
                 revised_content = self.patent_generator.revise_draft(feedback, self.current_doc_type)

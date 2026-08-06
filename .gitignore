@@ -7,3 +7,10 @@ __pycache__/
 
 # 生成的专利文档
 *.gradio_*.docx
+
+# 一键生成的输出目录
+outputs/
+
+# 运行时产物（每次运行覆盖写，无留档价值）
+closedloop_latest.json
+glossary_latest.txt

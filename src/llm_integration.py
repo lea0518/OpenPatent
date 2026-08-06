@@ -182,9 +182,26 @@ class PatentGenerator:
 {self.glossary}
 '''
 
+        # 【阶段4】重写时同样注入说明书作事实依据（stage>=2 且重写权利要求/摘要时）
+        # 闭环重写顺序为 说明书→权利要求→摘要，故下游读到的是本轮已修正的说明书
+        upstream_section = ""
+        if self.stage >= 2 and doc_type in ("权利要求书", "权利要求") and "说明书" in self.current_draft:
+            upstream_section = f'''
+### 已生成的说明书（权利要求的唯一事实依据，必须严格遵守）：
+以下是本发明已定稿的说明书。权利要求中的每个技术特征都必须能在说明书中找到对应描述，禁止引入说明书未描述的部件、模块或技术特征，术语须与说明书完全一致。
+{self.current_draft["说明书"]}
+'''
+        elif self.stage >= 2 and doc_type == "摘要" and "说明书" in self.current_draft:
+            upstream_section = f'''
+### 已生成的说明书（摘要须据此浓缩，必须严格遵守）：
+摘要是下面这份说明书的高度概括。请只概括说明书中已有的技术方案，不要引入说明书没有的内容，术语与说明书保持一致。
+{self.current_draft["说明书"]}
+'''
+
         # 构建修订提示信息
         prompt = f'''你是一个专业的专利申请文档撰写助手。请根据用户反馈修改{doc_type}，同时确保修订后的内容仍然符合原始技术文档的风格和格式，并基于相关专利内容。
 {glossary_section}
+{upstream_section}
 ### 要求：
 1. **风格和格式**：继续模仿【原始技术文档】的行文风格和格式。
 2. **内容修改**：根据【修改意见】对【当前版本】进行修订，确保修改后的内容准确、完整。

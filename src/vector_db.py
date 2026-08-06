@@ -82,6 +82,10 @@ class VectorDB:
         """
         os.makedirs(os.path.dirname(path), exist_ok=True)
         faiss.write_index(self.index, path)
+        # 同时保存文本字典（FAISS 只存向量，texts 必须单独存，否则加载后检索取不到原文）
+        import json
+        with open(path + ".texts.json", "w", encoding="utf-8") as f:
+            json.dump(self.texts, f, ensure_ascii=False)
 
     def load_index(self, path: str):
         """
@@ -91,6 +95,16 @@ class VectorDB:
         path (str): 加载索引的路径。
         """
         self.index = faiss.read_index(path)
+        # 一并加载文本字典（JSON 的 key 会变成字符串，需转回 int 以匹配 FAISS 返回的整数下标）
+        import json
+        texts_path = path + ".texts.json"
+        if os.path.exists(texts_path):
+            with open(texts_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            self.texts = {int(k): v for k, v in raw.items()}
+            self.next_index = len(self.texts)
+        else:
+            logging.warning(f"未找到文本文件 {texts_path}，检索将取不到原文；请重新『处理专利文件』重建知识库。")
 
     def search(self, query: str, k=2) -> List[str]:
         """

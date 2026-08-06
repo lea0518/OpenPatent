@@ -8,8 +8,13 @@ from pdf_processor import PDFProcessor
 from vector_db import VectorDB
 from llm_integration import PatentGenerator
 import os
+import evaluator
 # os.environ["SSL_CERT_FILE"] = r"H:\anadonda\envs\OpenPatent\Library\ssl\cacert.pem"
 from docx.oxml.ns import qn
+
+# 【阶段4】闭环控制参数
+ISSUE_THRESHOLD = 2        # 问题总数 <= 此值即达标停止（阶段2基线约2，达到基线水平即收手，不为清零而做高风险重写）
+MAX_REWRITE_ROUNDS = 2     # 最多自动重写轮数，防止无限循环、控制 API 开销
 
 class WebUI:
     """
@@ -55,6 +60,7 @@ class WebUI:
                         ("阶段0 基线（无术语表, 高温, 独立生成）", 0),
                         ("阶段1 术语约束（术语表 + 低温）", 1),
                         ("阶段2 分层串联（+ 权利要求/摘要依赖说明书）", 2),
+                        ("阶段4 生成-评估-重写闭环（+ 自动评估并重写至达标）", 3),
                     ],
                     value=2,
                     label="消融实验阶段（切换后点一键分层生成即按该阶段运行）",
@@ -233,7 +239,133 @@ class WebUI:
             self.current_doc_type = doc_type
             messages.append(("助手", f"【{doc_type}】\n{content}"))
 
+        # 【阶段4】stage>=3：接入 生成→评估→重写 自动闭环（query 此处仍是交底书全文）
+        if stage >= 3:
+            messages = self._run_closed_loop(query, messages)
+
         return messages
+
+    # ===================== 【阶段4】生成→评估→重写 自动闭环 =====================
+    def _strip_tags(self, content: str) -> str:
+        """把带 <标题>/<段落> 标签的生成内容剥成纯文本，喂给评估器。
+        与 _save_content_to_docx 同款正则，保证与阶段3离线评估同口径。剥出为空则回退原文。"""
+        import re
+        parts = [t.strip() for _, t in
+                 re.findall(r'<(标题|段落)>(.*?)</\1>', content or "", flags=re.S) if t.strip()]
+        text = "\n".join(parts)
+        return text if text else (content or "")
+
+    def _build_feedback_by_part(self, issues: dict) -> dict:
+        """把评估器返回的结构化问题，按"重写目标路由"拆成各部分的针对性反馈。
+        返回 {"说明书":文本或None, "权利要求书":..., "摘要":...}，无问题的部分为 None。
+        路由：无支撑特征→仅权利要求；术语漂移→权利要求+摘要；自造术语→三部分。"""
+        drift = issues.get("term_drift", {}).get("items", []) or []
+        unsup = issues.get("unsupported_claims", {}).get("items", []) or []
+        fab = issues.get("fabricated_terms", {}).get("items", []) or []
+
+        def blk(title, tip, items):
+            if not items:
+                return ""
+            return "\n".join([f"【{title}】{tip}"] + [f"- {it}" for it in items]) + "\n"
+
+        head = ("以下是专利审查发现的问题，请【只针对这些问题】修改本部分，"
+                "不要改动无关内容，保持原有 <标题>/<段落> XML 标签格式。\n")
+        fb = {"说明书": None, "权利要求书": None, "摘要": None}
+
+        claim_body = (blk("无说明书支撑的权利要求特征", "（必须删除，或改写为说明书中已有的特征）：", unsup)
+                      + blk("术语漂移", "（必须统一为说明书中的写法）：", drift)
+                      + blk("自造术语", "（必须删除或替换为交底书/术语表中的规范术语）：", fab))
+        if claim_body:
+            fb["权利要求书"] = head + claim_body
+
+        abst_body = (blk("术语漂移", "（必须统一为说明书中的写法）：", drift)
+                     + blk("自造术语", "（必须删除或替换为规范术语）：", fab))
+        if abst_body:
+            fb["摘要"] = head + abst_body
+
+        spec_body = blk("自造术语", "（说明书为事实源，必须删除或替换为规范术语）：", fab)
+        if spec_body:
+            fb["说明书"] = head + spec_body
+
+        return fb
+
+    def _run_closed_loop(self, tech, messages):
+        """闭环主体：初评 → 若问题>阈值则按部分重写 → 复评，最多 MAX_REWRITE_ROUNDS 轮。
+        tech 为交底书全文。全程把 total_issues 轨迹记入 messages 与 closedloop_latest.json。"""
+        gen = self.patent_generator
+        glossary = gen.glossary
+
+        def evaluate_now():
+            spec = self._strip_tags(gen.current_draft.get("说明书", ""))
+            abst = self._strip_tags(gen.current_draft.get("摘要", ""))
+            claim = self._strip_tags(gen.current_draft.get("权利要求书", ""))
+            return evaluator.extract_issues(tech, spec, abst, claim, glossary)
+
+        def total_of(iss):
+            return iss.get("total_issues") if "_parse_error" not in iss else None
+
+        def summarize(iss, label):
+            if "_parse_error" in iss:
+                return f"{label}：评估解析失败（{iss.get('_parse_error')}），闭环中止。"
+            return (f"{label}：问题总数 {iss['total_issues']}"
+                    f"（术语漂移 {iss['term_drift']['count']} / 无支撑权利要求 "
+                    f"{iss['unsupported_claims']['count']} / 自造术语 {iss['fabricated_terms']['count']}）")
+
+        trajectory, rounds_log = [], []
+        issues = evaluate_now()
+        t = total_of(issues)
+        messages.append(("系统", "【阶段4闭环】" + summarize(issues, "初评")))
+        if t is None:
+            self._dump_closedloop(trajectory, rounds_log)
+            return messages
+        trajectory.append(t)
+        rounds_log.append({"round": 0, "issues": issues})
+
+        rnd = 0
+        while t > ISSUE_THRESHOLD and rnd < MAX_REWRITE_ROUNDS:
+            rnd += 1
+            # 回滚快照：重写前存一份当前草稿。若本轮改完问题反而变多，就还原，避免"越改越糟"
+            snapshot = dict(gen.current_draft)
+            prev_t = t
+            fbmap = self._build_feedback_by_part(issues)
+            # 固定顺序：先修事实源(说明书)，下游再对齐更新后的说明书
+            for doc_type in ("说明书", "权利要求书", "摘要"):
+                if fbmap.get(doc_type):
+                    revised = gen.revise_draft(fbmap[doc_type], doc_type)
+                    self.current_doc_type = doc_type
+                    messages.append(("助手", f"【第{rnd}轮重写·{doc_type}】\n{revised}"))
+            issues = evaluate_now()
+            t2 = total_of(issues)
+            messages.append(("系统", summarize(issues, f"第{rnd}轮重写后")))
+            if t2 is None:
+                break
+            trajectory.append(t2)
+            rounds_log.append({"round": rnd, "issues": issues})
+            # 本轮反而变差 → 回滚到重写前，并停止（既然改不动，再改只会更糟）
+            if t2 > prev_t:
+                gen.current_draft = snapshot
+                messages.append(("系统", f"⚠️ 第{rnd}轮重写后问题数从 {prev_t} 升至 {t2}，"
+                                         f"已回滚到本轮重写前的版本并停止闭环。"))
+                trajectory.append(prev_t)  # 记录回滚后的最终问题数
+                break
+            t = t2
+
+        messages.append(("系统", f"【阶段4闭环结束】问题数轨迹: {trajectory}"
+                                 f"（阈值 {ISSUE_THRESHOLD}，最多 {MAX_REWRITE_ROUNDS} 轮）"))
+        self._dump_closedloop(trajectory, rounds_log)
+        return messages
+
+    def _dump_closedloop(self, trajectory, rounds_log):
+        """把闭环问题数轨迹落盘，供论文取数。"""
+        import json
+        try:
+            with open("closedloop_latest.json", "w", encoding="utf-8") as f:
+                json.dump({"stage": 3, "threshold": ISSUE_THRESHOLD,
+                           "max_rounds": MAX_REWRITE_ROUNDS,
+                           "trajectory": trajectory, "rounds": rounds_log},
+                          f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"闭环日志写入失败: {e}")
 
     def _generate_draft(self, tech_doc, db_type: str, doc_type: str):
         """

@@ -14,3 +14,6 @@ outputs/
 # 运行时产物（每次运行覆盖写，无留档价值）
 closedloop_latest.json
 glossary_latest.txt
+
+# 提交信息草稿模板
+commit_msg.txt

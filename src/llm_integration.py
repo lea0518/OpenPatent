@@ -21,6 +21,11 @@ class PatentGenerator:
         self.current_draft: Dict[str, str] = {}
         self.query: str = ""
         self.context: str = ""
+        # 按 doc_type 分别保存各自检索到的参考内容。
+        # 三部分各自检索不同的向量库（说明书库/权利要求库/摘要库），若只用单个
+        # self.context，一键生成跑完后它会停在最后生成的"摘要"上；后续 revise_draft
+        # 重写说明书/权利要求时就会拿别人的摘要当风格样本，传递错误信号。
+        self.contexts: Dict[str, str] = {}
         self.glossary: str = ""  # 【阶段1】术语表：从技术文档抽取的关键术语，贯穿说明书/摘要/权利要求生成
         # 【消融开关】stage 档位控制启用哪些改进，用于消融实验（同一套代码跑不同阶段）：
         #   0 = 基线(无术语表, temp0.5/0.6, 独立生成)
@@ -81,6 +86,8 @@ class PatentGenerator:
         """
         self.query = query
         self.context = context
+        # 同时按 doc_type 归档，供 revise_draft 取回本部分对应库的参考内容
+        self.contexts[doc_type] = context
 
         # 【阶段1】术语约束段：若已构建术语表，则强制生成时沿用这些术语（stage>=1 才启用）
         glossary_section = ""
@@ -198,6 +205,10 @@ class PatentGenerator:
 {self.current_draft["说明书"]}
 '''
 
+        # 取回本部分当初检索到的参考内容。回退到 self.context 是为兼容"先手动生成
+        # 再修订"的老路径；若连它也没有则给出明确占位，避免把 None 拼进 prompt。
+        ctx = self.contexts.get(doc_type) or self.context or "（无参考专利内容）"
+
         # 构建修订提示信息
         prompt = f'''你是一个专业的专利申请文档撰写助手。请根据用户反馈修改{doc_type}，同时确保修订后的内容仍然符合原始技术文档的风格和格式，并基于相关专利内容。
 {glossary_section}
@@ -212,7 +223,7 @@ class PatentGenerator:
    - 如果{doc_type}是**说明书**部分，请确保技术方案的描述详细且具有可实施性。
 
 ### 模仿和参考的原始技术文档（参考风格和格式）：
-{self.context}
+{ctx}
 
 ### 相关专利内容：
 {self.query}

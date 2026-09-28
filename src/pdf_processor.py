@@ -54,10 +54,12 @@ class PDFProcessor:
         return sections
 
 if __name__ == "__main__":
-    # 请替换为实际的 PDF 文件路径
-    pdf_file_path = 'H:\项目\OpenPatent\参考专利\专利文件\基于大语言模型的xx系统\一种基于大语言模型的日志分析方法.pdf'
+    import sys
+    if len(sys.argv) != 2:
+        print("用法: python pdf_processor.py <专利PDF路径>")
+        sys.exit(1)
     processor = PDFProcessor()
-    result = processor.split_pdf(pdf_file_path)
+    result = processor.split_pdf(sys.argv[1])
     for section, content in result.items():
         print(f"Section: {section}")
         print(content[:200])  # 打印前 200 个字符

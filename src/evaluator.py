@@ -343,8 +343,12 @@ def build_extract_prompt(tech, spec, abst, claim, glossary):
 不要给分、不要泛泛评价，只客观地【列举】具体问题实例，找不到就返回空列表。
 
 ### 需要逐条排查的三类问题：
-1. term_drift（术语漂移）：同一个部件/概念在不同部分用了不同写法。逐对列出，格式："写法甲 | 写法乙 | 出现位置"。
+1. term_drift（术语漂移）：同一个部件/概念在不同部分用了【不同】写法。逐对列出，格式："写法甲 | 写法乙 | 出现位置"。
    例如："8bit .GGUF格式 | .GGUF格式 | 说明书用全称,权利要求丢了8bit"
+   ⚠️ 严禁列出写法一致的术语：若某术语在各部分写法完全相同，它【没有问题】，绝对不要列入，
+   也不要写"说明书和权利要求一致"之类的说明。写法甲与写法乙必须【字面不同】，否则不得列出。
+   ⚠️ 也不要把"整体与其部件"当作漂移：如"车载设备"与"车载设备的CPU"是不同概念，不算同一概念的两种写法。
+   本项只统计同一概念被写成两种不同措辞的情况；找不到就返回空列表。
 2. unsupported_claims（无说明书支撑的权利要求特征）：权利要求里出现、但说明书中找不到对应描述的技术特征。逐条列出该特征名及原因。
 3. fabricated_terms（自造术语）：说明书、摘要或权利要求中出现，但交底书和术语表里都没有、疑似模型自行发明的部件/模块名。逐条列出。
 
@@ -373,6 +377,23 @@ def build_extract_prompt(tech, spec, abst, claim, glossary):
 }}"""
 
 
+def _filter_same_term_drift(items):
+    """剔除"写法甲与写法乙其实相同"的伪漂移条目。
+
+    裁判有时会把各部分写法一致的术语也列进 term_drift（并附"说明书和权利要求一致"
+    之类的说明），若直接计数会虚高问题总数。这里按 '|' 劈出前两段比对，字面相同即丢弃。
+    返回 (保留的条目, 被丢弃的条目)。不含 '|' 的条目保守保留，交由人工复核。
+    """
+    kept, dropped = [], []
+    for it in items:
+        parts = [p.strip() for p in str(it).split("|")]
+        if len(parts) >= 2 and parts[0] and parts[0] == parts[1]:
+            dropped.append(it)
+        else:
+            kept.append(it)
+    return kept, dropped
+
+
 def extract_issues(tech, spec, abst, claim, glossary=""):
     """对单份文档抽取三类问题，返回含计数的结果。"""
     client, model, warn = pick_judge_model()
@@ -397,6 +418,11 @@ def extract_issues(tech, spec, abst, claim, glossary=""):
         result["_warning"] = warn
     for key in ("term_drift", "unsupported_claims", "fabricated_terms"):
         items = data.get(key, []) or []
+        if key == "term_drift":
+            items, dropped = _filter_same_term_drift(items)
+            if dropped:
+                # 裁判仍把"两处写法一致"报成漂移时，程序侧硬过滤，避免污染计数
+                result["_drift_filtered"] = dropped
         result[key] = {"count": len(items), "items": items}
     result["total_issues"] = sum(result[k]["count"] for k in
                                  ("term_drift", "unsupported_claims", "fabricated_terms"))

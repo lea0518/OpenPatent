@@ -25,13 +25,13 @@ class WebUI:
         初始化网页用户界面。
         """
         self.patent_generator = PatentGenerator()
-        self.current_stage = None
         self.current_doc_type = None
         self.tech_doc_name = None          # 记住上传的技术文档名（不含扩展名），用于命名输出
         self.db_paths = {
-            '摘要': r'dbs\abstract',
-            '说 明 书': r'dbs\specification',
-            '权 利 要 求 书': r'dbs\claims'
+            # 用 os.path.join 而非反斜杠字面量，保证 Linux/macOS 下也能正确解析
+            '摘要': os.path.join('dbs', 'abstract'),
+            '说 明 书': os.path.join('dbs', 'specification'),
+            '权 利 要 求 书': os.path.join('dbs', 'claims'),
         }
         self.use_existing_db = False
 
@@ -83,9 +83,11 @@ class WebUI:
             process_btn.click(self.process_patents, inputs=ref_patents, outputs=process_output)
             process_btn2.click(self.load_existing_db, outputs=process_output)
             gen_all_btn.click(self.generate_all_layered, inputs=[tech_doc, stage_selector], outputs=output_preview)
-            gen_spec_btn.click(self.generate_specification, inputs=tech_doc, outputs=output_preview)
-            gen_abstract_btn.click(self.generate_abstract, inputs=tech_doc, outputs=output_preview)
-            gen_claims_btn.click(self.generate_claims, inputs=tech_doc, outputs=output_preview)
+            # 三个单独按钮同样传入 stage_selector：否则它们会沿用上一次一键生成残留的
+            # stage 值，导致 UI 显示的档位与实际运行档位不一致，静默产出错误实验数据
+            gen_spec_btn.click(self.generate_specification, inputs=[tech_doc, stage_selector], outputs=output_preview)
+            gen_abstract_btn.click(self.generate_abstract, inputs=[tech_doc, stage_selector], outputs=output_preview)
+            gen_claims_btn.click(self.generate_claims, inputs=[tech_doc, stage_selector], outputs=output_preview)
             submit_feedback.click(self.submit_feedback, inputs=user_feedback, outputs=output_preview)
             
         return demo
@@ -103,9 +105,10 @@ class WebUI:
         if not files:
             return "请上传参考专利文件"
         processor = PDFProcessor()
-        
+
         section_array = []
         skipped = []
+        missing = []          # 记录"解析成功但缺某章节"的情况，便于用户排查
         for file in files:
             try:
                 sections = processor.split_pdf(file.name)
@@ -114,26 +117,33 @@ class WebUI:
                 continue
             for db_type in self.db_paths:
                 section_content = sections.get(db_type)
-                section_array.append(section_content)
-                if section_content:
-                    print(f"dbtype:{db_type}")
-                    print(section_content)
+                # 缺章节时统一存空串而非 None：None 送进 embedding API 会被 400 拒绝，
+                # 导致整批建库失败。空串由 create_index 负责跳过。
+                if not section_content or not section_content.strip():
+                    missing.append(f"{os.path.basename(file.name)} 缺「{db_type}」")
+                    section_array.append("")
                 else:
-                    print(f"Section {db_type} not found in PDF")
-        section_array = np.array(section_array)
+                    section_array.append(section_content)
+        if not section_array:
+            return "所有上传文件都无法解析，请检查 PDF 是否为标准专利文本格式（非扫描件）"
+        section_array = np.array(section_array, dtype=object)
         section_array = section_array.reshape((-1,3))
-        print(f"翻转前：{section_array}")
         section_array = section_array.T
-        print(f"翻转后：{section_array}")
-        self.db_list = [0 for i in range(3)]
-        for i,db_type in enumerate(self.db_paths):
-            self.db_list[i] = VectorDB(db_type)
-            self.db_list[i].create_index(section_array[i])
-            self.db_list[i].save_index(self.db_paths[db_type])
+        self.db_list = [0 for _ in range(3)]
+        try:
+            for i, db_type in enumerate(self.db_paths):
+                self.db_list[i] = VectorDB(db_type)
+                self.db_list[i].create_index(section_array[i])
+                self.db_list[i].save_index(self.db_paths[db_type])
+        except Exception as e:
+            self.use_existing_db = False
+            return f"❌ 建立知识库失败：{type(e).__name__}: {e}\n\n知识库未就绪，请修正后重试。"
         self.use_existing_db = True
         msg = "参考专利处理完成，已建立三个知识库！"
         if skipped:
             msg += "\n\n⚠️ 以下文件损坏或无法解析，已跳过：\n" + "\n".join(skipped)
+        if missing:
+            msg += "\n\n⚠️ 以下章节未能切出（该条已跳过，不影响其余）：\n" + "\n".join(missing)
         return msg
 
     def load_existing_db(self):
@@ -143,49 +153,60 @@ class WebUI:
         返回:
         str: 加载结果信息。
         """
+        db_list = [0 for _ in range(3)]
+        try:
+            for i, db_type in enumerate(self.db_paths):
+                db_list[i] = VectorDB(db_type)
+                db_list[i].load_index(self.db_paths[db_type])
+        except Exception as e:
+            # 加载失败不能把 use_existing_db 置真，否则会带着空库去生成（RAG 静默空转）
+            self.use_existing_db = False
+            return (f"❌ 加载本地知识库失败：{type(e).__name__}: {e}\n\n"
+                    f"请点击上方『处理专利文件』重新建库。")
+        # 全部成功后才提交状态，避免部分加载成功导致 db_list 半残
+        self.db_list = db_list
         self.use_existing_db = True
-        self.db_list = [0 for i in range(3)]
-        for i, db_type in enumerate(self.db_paths):
-            self.db_list[i] = VectorDB(db_type)
-            self.db_list[i].load_index(self.db_paths[db_type])
-        return "已加载本地知识库"
+        total = sum(db.index.ntotal for db in self.db_list)
+        return f"已加载本地知识库（三库合计 {total} 条向量）"
 
-    def generate_specification(self, tech_doc):
+    def generate_specification(self, tech_doc, stage=2):
         """
         生成专利说明书。
 
         参数:
         tech_doc: 上传的技术文档。
+        stage (int): 消融档位，由 UI 下拉框传入。
 
         返回:
         list: 包含系统消息和生成内容的列表。
         """
-        self.current_stage = "specification"
-        return self._generate_draft(tech_doc, "说 明 书", "说明书")
+        return self._generate_draft(tech_doc, "说 明 书", "说明书", stage)
 
-    def generate_abstract(self, tech_doc):
+    def generate_abstract(self, tech_doc, stage=2):
         """
         生成专利摘要。
 
         参数:
         tech_doc: 上传的技术文档。
+        stage (int): 消融档位，由 UI 下拉框传入。
 
         返回:
         list: 包含系统消息和生成内容的列表。
         """
-        return self._generate_draft(tech_doc, "摘要", "摘要")
+        return self._generate_draft(tech_doc, "摘要", "摘要", stage)
 
-    def generate_claims(self, tech_doc):
+    def generate_claims(self, tech_doc, stage=2):
         """
         生成专利权利要求书。
 
         参数:
         tech_doc: 上传的技术文档。
+        stage (int): 消融档位，由 UI 下拉框传入。
 
         返回:
         list: 包含系统消息和生成内容的列表。
         """
-        return self._generate_draft(tech_doc, "权 利 要 求 书", "权利要求书")
+        return self._generate_draft(tech_doc, "权 利 要 求 书", "权利要求书", stage)
 
     def generate_all_layered(self, tech_doc, stage=2):
         """
@@ -208,9 +229,10 @@ class WebUI:
         self.tech_doc_name = os.path.splitext(os.path.basename(tech_doc.name))[0]
         query = "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
 
-        # 每次一键生成前重置状态，避免上一份文档的草稿/术语表污染（多文档实验必需）
+        # 每次一键生成前重置状态，避免上一份文档的草稿/术语表/检索上下文污染（多文档实验必需）
         self.patent_generator.current_draft = {}
         self.patent_generator.glossary = ""
+        self.patent_generator.contexts = {}
 
         # 术语表仅在 stage>=1 构建（stage0 基线不用术语表）
         if stage >= 1:
@@ -353,7 +375,39 @@ class WebUI:
         messages.append(("系统", f"【阶段4闭环结束】问题数轨迹: {trajectory}"
                                  f"（阈值 {ISSUE_THRESHOLD}，最多 {MAX_REWRITE_ROUNDS} 轮）"))
         self._dump_closedloop(trajectory, rounds_log)
+        # 自动归档本轮全部产物：闭环跑一次成本很高，若只写固定名的 latest 文件，
+        # 下次运行即被覆盖，事后无法用 term_metrics.py 复算指标、也无法复核文本改动
+        archive = self._archive_run(trajectory, rounds_log, glossary)
+        if archive:
+            messages.append(("系统", f"📦 本轮产物已归档到：{archive}"))
         return messages
+
+    def _archive_run(self, trajectory, rounds_log, glossary):
+        """把本次闭环运行的全部产物落盘到带时间戳的目录，供论文复算与复核。
+
+        归档内容与 experiments/stageX_*/outputs/ 目录结构对齐：
+          三份 docx + closedloop.json + glossary.txt
+        返回归档目录路径；失败返回 None（不影响主流程）。
+        """
+        import json
+        try:
+            base = self.tech_doc_name or "patent"
+            out_dir = os.path.join("experiments", "stage4_closedloop",
+                                   f"{base}_{int(time.time())}")
+            os.makedirs(out_dir, exist_ok=True)
+            for doc_type, content in self.patent_generator.current_draft.items():
+                self._save_content_to_docx(content, doc_type, out_dir)
+            with open(os.path.join(out_dir, "closedloop.json"), "w", encoding="utf-8") as f:
+                json.dump({"stage": 3, "threshold": ISSUE_THRESHOLD,
+                           "max_rounds": MAX_REWRITE_ROUNDS,
+                           "trajectory": trajectory, "rounds": rounds_log},
+                          f, ensure_ascii=False, indent=2)
+            with open(os.path.join(out_dir, "glossary.txt"), "w", encoding="utf-8") as f:
+                f.write(glossary or "")
+            return out_dir
+        except Exception as e:
+            print(f"闭环产物归档失败: {e}")
+            return None
 
     def _dump_closedloop(self, trajectory, rounds_log):
         """把闭环问题数轨迹落盘，供论文取数。"""
@@ -367,7 +421,7 @@ class WebUI:
         except Exception as e:
             print(f"闭环日志写入失败: {e}")
 
-    def _generate_draft(self, tech_doc, db_type: str, doc_type: str):
+    def _generate_draft(self, tech_doc, db_type: str, doc_type: str, stage=2):
         """
         生成专利文档初稿。
 
@@ -375,6 +429,7 @@ class WebUI:
         tech_doc: 上传的技术文档。
         db_type (str): 数据库类型，如 "摘要", "说明书", "权利要求书"。
         doc_type (str): 文档类型，如 "说明书", "摘要", "权利要求书"。
+        stage (int): 消融档位，由 UI 下拉框传入，避免沿用上次残留值。
 
         返回:
         list: 包含系统消息和生成内容的列表。
@@ -384,15 +439,25 @@ class WebUI:
         if tech_doc is None:
             return [("系统", "请先上传技术文档")]
 
+        # 与一键生成保持一致：以 UI 当前档位为准，否则会沿用上次残留的 stage
+        stage = int(stage)
+        self.patent_generator.stage = stage
+
         # 读取技术文档内容
         doc = Document(tech_doc.name)
         # 记住上传文档名（去掉路径和扩展名），供保存时命名用
-        self.tech_doc_name = os.path.splitext(os.path.basename(tech_doc.name))[0]
+        new_name = os.path.splitext(os.path.basename(tech_doc.name))[0]
+        # 换了交底书就必须清空上一份的草稿与术语表，否则会用 A 文档的术语表去写 B 文档
+        if self.tech_doc_name != new_name:
+            self.patent_generator.current_draft = {}
+            self.patent_generator.glossary = ""
+            self.patent_generator.contexts = {}
+        self.tech_doc_name = new_name
         query = "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
 
         # 【阶段1】首次生成时，用技术文档构建术语表，供后续各部分共享，保证术语一致
-        # （stage0 基线不用术语表；单独按钮沿用 generator 当前 stage 档位）
-        if self.patent_generator.stage >= 1 and not self.patent_generator.glossary:
+        # （stage0 基线不用术语表）
+        if stage >= 1 and not self.patent_generator.glossary:
             glossary = self.patent_generator.build_glossary(query)
             print(f"【术语表】\n{glossary}")
             # 自动存档术语表，供后续指标计算使用（不依赖翻终端）

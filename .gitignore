@@ -1,19 +1,42 @@
 # 环境变量 / 密钥，绝不提交
 .env
+.env.*
+!.env.example
 
 # Python
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
 
-# 生成的专利文档
-*.gradio_*.docx
+# 向量知识库（由用户自备的参考专利本地构建，不入库）
+dbs/
 
-# 一键生成的输出目录
+# 输入数据：参考专利 PDF、技术交底书（版权 / 未发表内容）
+参考专利/
+*.pdf
+
+# 生成的专利文书
 outputs/
+*.docx
+!docs/**/*.docx
+
+# 实验数据与记录（含未发表研究内容）
+experiments/
 
 # 运行时产物（每次运行覆盖写，无留档价值）
 closedloop_latest.json
 glossary_latest.txt
 
-# 提交信息草稿模板
+# 汇报材料 / 截图 / 草稿
+*.pptx
 commit_msg.txt
+项目技术总结.md
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store

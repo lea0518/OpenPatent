@@ -95,5 +95,3 @@ LLM_MODEL=gpt-4o
 | fastapi | 0.112.2 | 必须配 gradio 4.44，勿升 |
 | starlette | 0.38.6 | 必须配 gradio 4.44，勿升 |
 | huggingface-hub | 0.20.3 | 高版本删了 `HfFolder`，勿升 |
-</content>
-</invoke>
